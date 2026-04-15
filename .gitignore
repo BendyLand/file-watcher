@@ -2,3 +2,4 @@ one
 two
 check/*
 .zig-cache
+.watcher/*
