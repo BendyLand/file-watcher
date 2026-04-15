@@ -1,3 +1,4 @@
+// main.zig
 const std = @import("std");
 
 const watcher_dir = ".watcher";
@@ -47,14 +48,10 @@ pub fn main() !void {
     }
     // parse flags and directory path from remaining args.
     var include_hidden = false;
-    var null_separated = false;
     var watch_path: ?[]const u8 = null;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--hidden") or std.mem.eql(u8, arg, "-h")) {
             include_hidden = true;
-        }
-        else if (std.mem.eql(u8, arg, "--null") or std.mem.eql(u8, arg, "-0")) {
-            null_separated = true;
         }
         else {
             watch_path = arg;
@@ -116,19 +113,11 @@ pub fn main() !void {
     }
     if (changed_paths.items.len > 0) {
         try updateWatcherState(allocator, &prev_state, &current);
-        if (null_separated) {
-            for (changed_paths.items) |path| {
-                try stdout.writeAll(path);
-                try stdout.writeByte(0);
-            }
+        for (changed_paths.items, 0..) |path, i| {
+            if (i > 0) try stdout.writeByte(' ');
+            try stdout.writeAll(path);
         }
-        else {
-            for (changed_paths.items, 0..) |path, i| {
-                if (i > 0) try stdout.writeByte(' ');
-                try stdout.writeAll(path);
-            }
-            try stdout.writeByte('\n');
-        }
+        try stdout.writeByte('\n');
     }
 }
 
@@ -293,20 +282,15 @@ fn updateWatcherState(
         const f = try wd.createFile(filename, .{});
         f.close();
     }
-    // rewrite .index atomically: write to a temp file then rename into place.
-    const tmp_path = watcher_dir ++ "/.index.tmp";
-    {
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{});
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        var bw = std.io.bufferedWriter(tmp_file.writer());
-        var idx_it = current_files.iterator();
-        while (idx_it.next()) |e| {
-            try bw.writer().print("{s} {s}\n", .{ e.key_ptr.*, e.value_ptr.*.path });
-        }
-        try bw.flush();
-        tmp_file.close();
+    // rewrite .index with the current file list.
+    const index_file = try std.fs.cwd().createFile(index_path, .{});
+    defer index_file.close();
+    var bw = std.io.bufferedWriter(index_file.writer());
+    var idx_it = current_files.iterator();
+    while (idx_it.next()) |e| {
+        try bw.writer().print("{s} {s}\n", .{ e.key_ptr.*, e.value_ptr.*.path });
     }
-    try std.fs.cwd().rename(tmp_path, index_path);
+    try bw.flush();
 }
 
 fn initWatcher() !void {
@@ -345,12 +329,11 @@ fn clearWatcher(allocator: std.mem.Allocator) !void {
 
 fn printHelp(writer: anytype) !void {
     try writer.writeAll(
-        \\Usage: watcher [options] <directory_path>
+        \\Usage: watcher [--hidden] <directory_path>
         \\       watcher <command>
         \\
         \\Options:
         \\  -h, --hidden  Include hidden files and directories (dotfiles).
-        \\  -0, --null    Separate output paths with null bytes instead of spaces.
         \\
         \\Commands:
         \\  init   Create the .watcher/ state directory.
@@ -363,4 +346,3 @@ fn printHelp(writer: anytype) !void {
         \\
     );
 }
-
