@@ -1,0 +1,11 @@
+build:
+    zig build
+    mv zig-out/bin/file_watcher ./watcher
+
+run:
+    zig run src/main.zig
+
+clean:
+    rm -rf zig-out watcher
+
+
