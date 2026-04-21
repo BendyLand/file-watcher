@@ -19,7 +19,9 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    const stdout = std.io.getStdOut().writer();
+    var buf: [1024]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buf);
+    const stdout = &writer.interface;
     if (args.len < 2) {
         try printHelp(stdout);
         std.process.exit(1);
@@ -91,8 +93,8 @@ pub fn main() !void {
         current.deinit();
     }
     // collect changed paths.
-    var changed_paths = std.ArrayList([]const u8).init(allocator);
-    defer changed_paths.deinit();
+    var changed_paths: std.ArrayList([]const u8) = .empty;
+    defer changed_paths.deinit(allocator);
     // added / modified files.
     var curr_it = current.iterator();
     while (curr_it.next()) |e| {
@@ -100,18 +102,18 @@ pub fn main() !void {
         const info = e.value_ptr.*;
         if (prev_state.get(path_hash)) |old_hash| {
             if (!std.mem.eql(u8, old_hash, info.contents_hash)) {
-                try changed_paths.append(info.path);
+                try changed_paths.append(allocator,info.path);
             }
         }
         else {
-            try changed_paths.append(info.path);
+            try changed_paths.append(allocator,info.path);
         }
     }
     // deleted files: anything in the index that no longer appears on disk.
     var idx_it = prev_index.iterator();
     while (idx_it.next()) |e| {
         if (!current.contains(e.key_ptr.*)) {
-            try changed_paths.append(e.value_ptr.*);
+            try changed_paths.append(allocator,e.value_ptr.*);
         }
     }
     if (changed_paths.items.len > 0) {
@@ -156,7 +158,7 @@ fn hashBytes(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     h.update(bytes);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     h.final(&digest);
-    return std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&digest)});
+    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(&digest, std.fmt.Case.lower)});
 }
 
 // hashFile returns the lowercase hex SHA-256 of a file's contents.
@@ -172,7 +174,7 @@ fn hashFile(allocator: std.mem.Allocator, file_path: []const u8) ![]const u8 {
     }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     h.final(&digest);
-    return std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&digest)});
+    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(&digest, std.fmt.Case.lower)});
 }
 
 // computeCurrentFiles walks dir_path and returns a map of
@@ -298,12 +300,13 @@ fn updateWatcherState(
     {
         const tmp_file = try std.fs.cwd().createFile(tmp_path, .{});
         errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
-        var bw = std.io.bufferedWriter(tmp_file.writer());
+        var buf: [4096]u8 = undefined;
+        var bw = tmp_file.writer(&buf);
         var idx_it = current_files.iterator();
         while (idx_it.next()) |e| {
-            try bw.writer().print("{s} {s}\n", .{ e.key_ptr.*, e.value_ptr.*.path });
+            try bw.interface.print("{s} {s}\n", .{ e.key_ptr.*, e.value_ptr.*.path });
         }
-        try bw.flush();
+        try bw.interface.flush();
         tmp_file.close();
     }
     try std.fs.cwd().rename(tmp_path, index_path);
@@ -323,16 +326,16 @@ fn clearWatcher(allocator: std.mem.Allocator) !void {
     var dir = try std.fs.cwd().openDir(watcher_dir, .{ .iterate = true });
     defer dir.close();
     // collect names first; deleting while iterating is unsafe.
-    var to_delete = std.ArrayList([]const u8).init(allocator);
+    var to_delete: std.ArrayList([]const u8) = .empty;
     defer {
         for (to_delete.items) |name| allocator.free(name);
-        to_delete.deinit();
+        to_delete.deinit(allocator);
     }
     var it = dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind != .file) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
-        try to_delete.append(try allocator.dupe(u8, entry.name));
+        try to_delete.append(allocator, try allocator.dupe(u8, entry.name));
     }
     for (to_delete.items) |name| {
         dir.deleteFile(name) catch |err| {
@@ -362,5 +365,262 @@ fn printHelp(writer: anytype) !void {
         \\Dotfiles are ignored by default.
         \\
     );
+    try writer.flush();
 }
 
+// --- test helpers ---
+
+fn freeCurrentMap(allocator: std.mem.Allocator, map: *CurrentFilesMap) void {
+    var it = map.iterator();
+    while (it.next()) |e| {
+        allocator.free(e.key_ptr.*);
+        allocator.free(e.value_ptr.*.path);
+        allocator.free(e.value_ptr.*.contents_hash);
+    }
+    map.deinit();
+}
+
+fn collectChangedPaths(
+    allocator: std.mem.Allocator,
+    prev_state: *const HashPairMap,
+    prev_index: *const IndexMap,
+    current: *const CurrentFilesMap,
+) !std.ArrayList([]const u8) {
+    var list: std.ArrayList([]const u8) = .empty;
+    var curr_it = current.iterator();
+    while (curr_it.next()) |e| {
+        if (prev_state.get(e.key_ptr.*)) |old_hash| {
+            if (!std.mem.eql(u8, old_hash, e.value_ptr.*.contents_hash))
+                try list.append(allocator, e.value_ptr.*.path);
+        } else {
+            try list.append(allocator, e.value_ptr.*.path);
+        }
+    }
+    var idx_it = prev_index.iterator();
+    while (idx_it.next()) |e| {
+        if (!current.contains(e.key_ptr.*))
+            try list.append(allocator, e.value_ptr.*);
+    }
+    return list;
+}
+
+// --- tests ---
+
+test "initWatcher creates .watcher directory and .index file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+
+    try initWatcher();
+
+    var wdir = try tmp.dir.openDir(".watcher", .{});
+    defer wdir.close();
+    const idx = try tmp.dir.openFile(".watcher/.index", .{});
+    idx.close();
+}
+
+test "first run reports all files as changed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+    try initWatcher();
+    var f = try tmp.dir.createFile("a.txt", .{});
+    try f.writeAll("contents of a");
+    f.close();
+    f = try tmp.dir.createFile("b.txt", .{});
+    try f.writeAll("contents of b");
+    f.close();
+    var prev_state = HashPairMap.init(allocator);
+    defer freeStrMap(allocator, &prev_state);
+    var prev_index = IndexMap.init(allocator);
+    defer freeStrMap(allocator, &prev_index);
+    var current = try computeCurrentFiles(allocator, ".", false);
+    defer freeCurrentMap(allocator, &current);
+    var changed = try collectChangedPaths(allocator, &prev_state, &prev_index, &current);
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), changed.items.len);
+}
+
+test "second run with no changes reports nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+    try initWatcher();
+    var f = try tmp.dir.createFile("a.txt", .{});
+    try f.writeAll("hello");
+    f.close();
+    // first run — populate state
+    {
+        var prev_state = HashPairMap.init(allocator);
+        defer freeStrMap(allocator, &prev_state);
+        var current = try computeCurrentFiles(allocator, ".", false);
+        defer freeCurrentMap(allocator, &current);
+        try updateWatcherState(allocator, &prev_state, &current);
+    }
+    // second run — nothing changed
+    var prev_state = try loadWatcherState(allocator);
+    defer freeStrMap(allocator, &prev_state);
+    var prev_index = try loadIndex(allocator);
+    defer freeStrMap(allocator, &prev_index);
+    var current = try computeCurrentFiles(allocator, ".", false);
+    defer freeCurrentMap(allocator, &current);
+    var changed = try collectChangedPaths(allocator, &prev_state, &prev_index, &current);
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), changed.items.len);
+}
+
+test "modified file is detected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+    try initWatcher();
+    var f = try tmp.dir.createFile("a.txt", .{});
+    try f.writeAll("original");
+    f.close();
+    {
+        var prev_state = HashPairMap.init(allocator);
+        defer freeStrMap(allocator, &prev_state);
+        var current = try computeCurrentFiles(allocator, ".", false);
+        defer freeCurrentMap(allocator, &current);
+        try updateWatcherState(allocator, &prev_state, &current);
+    }
+    f = try tmp.dir.createFile("a.txt", .{});
+    try f.writeAll("modified content");
+    f.close();
+    var prev_state = try loadWatcherState(allocator);
+    defer freeStrMap(allocator, &prev_state);
+    var prev_index = try loadIndex(allocator);
+    defer freeStrMap(allocator, &prev_index);
+    var current = try computeCurrentFiles(allocator, ".", false);
+    defer freeCurrentMap(allocator, &current);
+    var changed = try collectChangedPaths(allocator, &prev_state, &prev_index, &current);
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), changed.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, changed.items[0], "a.txt"));
+}
+
+test "new file is detected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+    try initWatcher();
+    var f = try tmp.dir.createFile("a.txt", .{});
+    try f.writeAll("existing");
+    f.close();
+    {
+        var prev_state = HashPairMap.init(allocator);
+        defer freeStrMap(allocator, &prev_state);
+        var current = try computeCurrentFiles(allocator, ".", false);
+        defer freeCurrentMap(allocator, &current);
+        try updateWatcherState(allocator, &prev_state, &current);
+    }
+    f = try tmp.dir.createFile("b.txt", .{});
+    try f.writeAll("brand new");
+    f.close();
+    var prev_state = try loadWatcherState(allocator);
+    defer freeStrMap(allocator, &prev_state);
+    var prev_index = try loadIndex(allocator);
+    defer freeStrMap(allocator, &prev_index);
+    var current = try computeCurrentFiles(allocator, ".", false);
+    defer freeCurrentMap(allocator, &current);
+    var changed = try collectChangedPaths(allocator, &prev_state, &prev_index, &current);
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), changed.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, changed.items[0], "b.txt"));
+}
+
+test "deleted file is detected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+    try initWatcher();
+    var f = try tmp.dir.createFile("a.txt", .{});
+    try f.writeAll("will be deleted");
+    f.close();
+    f = try tmp.dir.createFile("b.txt", .{});
+    try f.writeAll("stays");
+    f.close();
+    {
+        var prev_state = HashPairMap.init(allocator);
+        defer freeStrMap(allocator, &prev_state);
+        var current = try computeCurrentFiles(allocator, ".", false);
+        defer freeCurrentMap(allocator, &current);
+        try updateWatcherState(allocator, &prev_state, &current);
+    }
+    try tmp.dir.deleteFile("a.txt");
+    var prev_state = try loadWatcherState(allocator);
+    defer freeStrMap(allocator, &prev_state);
+    var prev_index = try loadIndex(allocator);
+    defer freeStrMap(allocator, &prev_index);
+    var current = try computeCurrentFiles(allocator, ".", false);
+    defer freeCurrentMap(allocator, &current);
+    var changed = try collectChangedPaths(allocator, &prev_state, &prev_index, &current);
+    defer changed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), changed.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, changed.items[0], "a.txt"));
+}
+
+test "hidden files excluded by default, included with flag" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const orig = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(orig);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(orig) catch {};
+    try initWatcher();
+    var f = try tmp.dir.createFile("visible.txt", .{});
+    try f.writeAll("visible");
+    f.close();
+    f = try tmp.dir.createFile(".hidden", .{});
+    try f.writeAll("hidden");
+    f.close();
+    var prev_state = HashPairMap.init(allocator);
+    defer freeStrMap(allocator, &prev_state);
+    var prev_index = IndexMap.init(allocator);
+    defer freeStrMap(allocator, &prev_index);
+    var without_hidden = try computeCurrentFiles(allocator, ".", false);
+    defer freeCurrentMap(allocator, &without_hidden);
+    try std.testing.expectEqual(@as(usize, 1), without_hidden.count());
+    var with_hidden = try computeCurrentFiles(allocator, ".", true);
+    defer freeCurrentMap(allocator, &with_hidden);
+    try std.testing.expectEqual(@as(usize, 2), with_hidden.count());
+}
