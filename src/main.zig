@@ -29,10 +29,11 @@ pub fn main() !void {
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "init")) {
         initWatcher() catch |err| {
-            try stdout.print("Error initializing watcher: {any}\n", .{err});
+            std.debug.print("Error initializing watcher: {any}\n", .{err});
             std.process.exit(1);
         };
         try stdout.print("Watcher initialized.\n", .{});
+        try stdout.flush();
         return;
     }
     else if (std.mem.eql(u8, cmd, "help")) {
@@ -41,10 +42,11 @@ pub fn main() !void {
     }
     else if (std.mem.eql(u8, cmd, "clear") or std.mem.eql(u8, cmd, "clean")) {
         clearWatcher(allocator) catch |err| {
-            try stdout.print("Error clearing watcher state: {any}\n", .{err});
+            std.debug.print("Error clearing watcher state: {any}\n", .{err});
             std.process.exit(1);
         };
         try stdout.print("Watcher state cleared.\n", .{});
+        try stdout.flush();
         return;
     }
     // parse flags and directory path from remaining args.
@@ -64,12 +66,13 @@ pub fn main() !void {
     }
     if (watch_path == null) {
         try stdout.print("Error: no directory path provided.\n", .{});
+        try stdout.flush();
         std.process.exit(1);
     }
     // load existing state: scan .watcher/ filenames -> path_hash:contents_hash pairs.
     var prev_state = loadWatcherState(allocator) catch |err| {
         if (err == error.FileNotFound) {
-            try stdout.print(
+            std.debug.print(
                 "Error: '{s}' not found. Run `watcher init` first.\n",
                 .{watcher_dir},
             );
@@ -82,7 +85,10 @@ pub fn main() !void {
     var prev_index = try loadIndex(allocator);
     defer freeStrMap(allocator, &prev_index);
     // compute current state by walking the watched directory.
-    var current = try computeCurrentFiles(allocator, watch_path.?, include_hidden);
+    var current = computeCurrentFiles(allocator, watch_path.?, include_hidden) catch |err| {
+        std.debug.print("Unable to compute current files: {any}", .{err});
+        std.process.exit(1);
+    };
     defer {
         var it = current.iterator();
         while (it.next()) |e| {
@@ -122,6 +128,7 @@ pub fn main() !void {
             for (changed_paths.items) |path| {
                 try stdout.writeAll(path);
                 try stdout.writeByte(0);
+                try stdout.flush();
             }
         }
         else {
@@ -130,6 +137,7 @@ pub fn main() !void {
                 try stdout.writeAll(path);
             }
             try stdout.writeByte('\n');
+            try stdout.flush();
         }
     }
 }

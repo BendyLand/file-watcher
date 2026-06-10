@@ -3,3 +3,5 @@ two
 check/*
 .zig-cache
 .watcher/*
+*summary*
+watcher
